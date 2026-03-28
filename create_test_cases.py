@@ -1,10 +1,80 @@
 """
 create_test_cases.py
-Writes test_cases.xlsx with 24 synthetic banking test cases.
-Run once: python create_test_cases.py
+Writes test_cases.xlsx for run_tests.py.
+
+1. (Optional) Legacy banking fixtures — set INCLUDE_LEGACY_BANKING_FIXTURES.
+2. All *.html / *.htm under HTML_DOCS_DIR — content via html_to_md_conversion().
+   By default, questions are generated from each document with OpenAI
+   (GENERATE_QUESTIONS_FROM_HTML_DOCUMENT). Set False to use a single preset
+   question per file. Requires OPENAI_API_KEY when generation is on.
+
+Run: python create_test_cases.py
+Then: python run_tests.py
 """
 
+import asyncio
+import logging
+import os
+from pathlib import Path
+
+import aiohttp
 import openpyxl
+
+from question_gen_openai import generate_questions_for_document
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# HTML sources (edit HTML_DOCS_DIR and html_to_md_conversion)
+# ---------------------------------------------------------------------------
+
+# Folder containing your HTML documents (created next to this script by default).
+HTML_DOCS_DIR = Path(__file__).resolve().parent / "html_docs"
+
+# Set False if you only want rows from HTML_DOCS_DIR.
+INCLUDE_LEGACY_BANKING_FIXTURES = True
+
+
+def html_to_md_conversion(html_path: str) -> str:
+    """
+    Read one HTML file and return the document text used in the `document`
+    column (Markdown or plain text). Implement your table-preserving
+    conversion here.
+
+    Args:
+        html_path: Absolute or relative path to a .html file.
+
+    Returns:
+        String passed to test cases and later to run_tests.py / the evaluator.
+    """
+    # --- Replace this body with your HTML → Markdown pipeline ---
+    with open(html_path, encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+# Used for every HTML file unless overridden in HTML_QUESTIONS_BY_STEM.
+DEFAULT_HTML_QUESTION = (
+    "What are the key facts, figures, obligations, and any tabular or numeric "
+    "details in this document that a reader must know to answer operational "
+    "or compliance questions about it?"
+)
+
+# Optional: map file stem (filename without extension) → specific question.
+# Example: {"annual_report": "What revenue figures appear in the tables? ..."}
+HTML_QUESTIONS_BY_STEM: dict[str, str] = {}
+
+# True: LLM generates QUESTIONS_PER_HTML_DOC questions per HTML file (needs OPENAI_API_KEY).
+# False: one question per file from HTML_QUESTIONS_BY_STEM or DEFAULT_HTML_QUESTION (no API).
+GENERATE_QUESTIONS_FROM_HTML_DOCUMENT = True
+QUESTIONS_PER_HTML_DOC = 3
+
+
+def _iter_html_files() -> list[Path]:
+    if not HTML_DOCS_DIR.is_dir():
+        return []
+    paths = list(HTML_DOCS_DIR.glob("*.html")) + list(HTML_DOCS_DIR.glob("*.htm"))
+    return sorted(paths, key=lambda p: p.name.lower())
 
 # ---------------------------------------------------------------------------
 # Documents
@@ -237,21 +307,97 @@ SCENARIOS = [
 HEADERS = ["test_id", "document_type", "difficulty", "scenario_type",
            "question", "document", "expected_label"]
 
+def _append_rows_for_document(
+    rows: list,
+    counter: int,
+    doc_type: str,
+    question: str,
+    document_text: str,
+) -> int:
+    for scenario_type, expected_label, difficulty in SCENARIOS:
+        rows.append([
+            f"TC_{counter:03d}",
+            doc_type,
+            difficulty,
+            scenario_type,
+            question,
+            document_text.strip(),
+            expected_label,
+        ])
+        counter += 1
+    return counter
+
+
+async def _add_rows_for_html_files_llm(
+    rows: list,
+    counter: int,
+    html_files: list[Path],
+    api_key: str,
+) -> int:
+    async with aiohttp.ClientSession() as session:
+        for html_path in html_files:
+            stem = html_path.stem
+            document_text = html_to_md_conversion(str(html_path.resolve()))
+            if stem in HTML_QUESTIONS_BY_STEM:
+                questions = [HTML_QUESTIONS_BY_STEM[stem]]
+            else:
+                questions = await generate_questions_for_document(
+                    session, api_key, document_text, QUESTIONS_PER_HTML_DOC
+                )
+                if not questions:
+                    log.warning(
+                        "No LLM questions for %s; using DEFAULT_HTML_QUESTION.", stem
+                    )
+                    questions = [DEFAULT_HTML_QUESTION]
+            for question in questions:
+                counter = _append_rows_for_document(
+                    rows, counter, stem, question, document_text
+                )
+    return counter
+
+
 def main():
-    rows = []
+    rows: list[list] = []
     counter = 1
-    for doc_type in DOCUMENTS:
-        for scenario_type, expected_label, difficulty in SCENARIOS:
-            rows.append([
-                f"TC_{counter:03d}",
+
+    if INCLUDE_LEGACY_BANKING_FIXTURES:
+        for doc_type in DOCUMENTS:
+            counter = _append_rows_for_document(
+                rows,
+                counter,
                 doc_type,
-                difficulty,
-                scenario_type,
                 QUESTIONS[doc_type],
-                DOCUMENTS[doc_type].strip(),
-                expected_label,
-            ])
-            counter += 1
+                DOCUMENTS[doc_type],
+            )
+
+    html_files = _iter_html_files()
+    if html_files:
+        if GENERATE_QUESTIONS_FROM_HTML_DOCUMENT:
+            api_key = os.environ.get("OPENAI_API_KEY")
+            if not api_key:
+                raise SystemExit(
+                    "OPENAI_API_KEY is required when HTML files are present and "
+                    "GENERATE_QUESTIONS_FROM_HTML_DOCUMENT is True. "
+                    "Set the env var, or set GENERATE_QUESTIONS_FROM_HTML_DOCUMENT = False "
+                    "to use DEFAULT_HTML_QUESTION / HTML_QUESTIONS_BY_STEM only."
+                )
+            counter = asyncio.run(
+                _add_rows_for_html_files_llm(rows, counter, html_files, api_key)
+            )
+        else:
+            for html_path in html_files:
+                stem = html_path.stem
+                question = HTML_QUESTIONS_BY_STEM.get(stem, DEFAULT_HTML_QUESTION)
+                document_text = html_to_md_conversion(str(html_path.resolve()))
+                counter = _append_rows_for_document(
+                    rows, counter, stem, question, document_text
+                )
+
+    if not rows:
+        raise SystemExit(
+            "No test cases generated. Add .html files under HTML_DOCS_DIR, "
+            "or set INCLUDE_LEGACY_BANKING_FIXTURES = True."
+        )
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -265,7 +411,13 @@ def main():
         ws.column_dimensions[col].width = width
 
     wb.save("test_cases.xlsx")
-    print(f"Written {len(rows)} test cases → test_cases.xlsx")
+    n_html = len(html_files)
+    gen = GENERATE_QUESTIONS_FROM_HTML_DOCUMENT and bool(html_files)
+    print(
+        f"Written {len(rows)} test cases → test_cases.xlsx "
+        f"({n_html} HTML source(s), llm_questions={gen}, "
+        f"legacy_banking={INCLUDE_LEGACY_BANKING_FIXTURES})"
+    )
 
 if __name__ == "__main__":
     main()
