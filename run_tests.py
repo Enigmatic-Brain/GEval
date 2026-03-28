@@ -1,0 +1,184 @@
+"""
+run_tests.py
+Reads test_cases.xlsx → generates model responses → evaluates completeness
+→ writes results.xlsx
+
+Usage:
+  export OPENAI_API_KEY=sk-...
+  python run_tests.py
+"""
+
+import asyncio
+import json
+import logging
+import os
+from datetime import datetime
+
+import aiohttp
+import openpyxl
+from completeness_evaluator_openai import evaluate_completeness
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+MODEL      = "gpt-4o"
+
+# ---------------------------------------------------------------------------
+# Prompt to auto-generate a model response for a given scenario
+# ---------------------------------------------------------------------------
+
+RESPONSE_PROMPT = """\
+Generate a model response for the question below based on the document.
+Your response quality must match the scenario:
+
+- complete: Cover ALL information — every detail, number, condition, edge case.
+- mostly_complete: Cover main points but miss 2–3 specific details or numbers.
+- partial: Cover only 2–3 obvious surface-level points. Skip most specifics.
+- incomplete: Write 1–2 vague generic sentences. Barely address the question.
+
+Scenario: {scenario}
+Question: {question}
+Document: {document}
+
+Return only the response text. No preamble.
+"""
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+async def post_openai(session, api_key, prompt):
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": MODEL,
+        "max_tokens": 1000,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    async with session.post(OPENAI_URL, json=payload, headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=60)) as resp:
+        data = await resp.json()
+    return data["choices"][0]["message"]["content"].strip()
+
+
+def read_excel(path):
+    wb = openpyxl.load_workbook(path)
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))
+    headers = rows[0]
+    return [dict(zip(headers, row)) for row in rows[1:] if any(row)]
+
+
+def write_excel(results, path):
+    wb = openpyxl.Workbook()
+
+    # Sheet 1 — summary
+    ws1 = wb.active
+    ws1.title = "Results"
+    headers = [
+        "test_id", "document_type", "scenario_type", "expected_label",
+        "actual_label", "score", "pass_fail", "total_claims",
+        "critical_claims", "supporting_claims",
+        "missing_critical", "missing_supporting",
+        "model_response", "timestamp",
+    ]
+    ws1.append(headers)
+    for r in results:
+        ws1.append([r.get(h, "") for h in headers])
+
+    # Sheet 2 — per-claim breakdown
+    ws2 = wb.create_sheet("Claim Breakdown")
+    ws2.append(["test_id", "document_type", "scenario_type",
+                "claim_id", "coverage_score", "coverage_label", "reason"])
+    for r in results:
+        for c in r.get("claims", []):
+            ws2.append([
+                r["test_id"], r["document_type"], r["scenario_type"],
+                c["claim_id"], c["coverage_score"], c["coverage_label"], c["reason"],
+            ])
+
+    # Basic column widths
+    for ws in (ws1, ws2):
+        for col in ws.columns:
+            ws.column_dimensions[col[0].column_letter].width = 20
+
+    wb.save(path)
+    log.info(f"Saved → {path}")
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+async def main():
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise EnvironmentError("Set OPENAI_API_KEY first.")
+
+    test_cases = read_excel("test_cases.xlsx")
+    log.info(f"Loaded {len(test_cases)} test cases")
+
+    results = []
+    async with aiohttp.ClientSession() as session:
+        for i, tc in enumerate(test_cases, 1):
+            log.info(f"\n[{i}/{len(test_cases)}] {tc['test_id']} | {tc['document_type']} | {tc['scenario_type']}")
+            try:
+                # Step 0: generate model response
+                prompt = RESPONSE_PROMPT.format(
+                    scenario=tc["scenario_type"],
+                    question=tc["question"],
+                    document=tc["document"],
+                )
+                model_response = await post_openai(session, api_key, prompt)
+
+                # Steps 1–3: evaluate completeness
+                eval_result = await evaluate_completeness(
+                    question=tc["question"],
+                    model_response=model_response,
+                    document=tc["document"],
+                    api_key=api_key,
+                )
+
+                actual   = eval_result["completeness_label"]
+                expected = tc["expected_label"]
+                results.append({
+                    "test_id":           tc["test_id"],
+                    "document_type":     tc["document_type"],
+                    "scenario_type":     tc["scenario_type"],
+                    "expected_label":    expected,
+                    "actual_label":      actual,
+                    "score":             eval_result["weighted_completeness_score"],
+                    "pass_fail":         "PASS" if actual == expected else "FAIL",
+                    "total_claims":      eval_result["total_claims"],
+                    "critical_claims":   eval_result["critical_claims"],
+                    "supporting_claims": eval_result["supporting_claims"],
+                    "missing_critical":  "; ".join(eval_result["missing_critical_claims"]),
+                    "missing_supporting":"; ".join(eval_result["missing_supporting_claims"]),
+                    "model_response":    model_response,
+                    "timestamp":         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "claims":            eval_result["coverage_details"],
+                })
+                log.info(f"  Score={eval_result['weighted_completeness_score']:.2f} | {actual} | {'PASS' if actual == expected else 'FAIL'}")
+
+            except Exception as e:
+                log.error(f"  Failed: {e}")
+                results.append({
+                    "test_id":       tc["test_id"],
+                    "document_type": tc["document_type"],
+                    "scenario_type": tc["scenario_type"],
+                    "expected_label":tc.get("expected_label", ""),
+                    "actual_label":  f"ERROR: {e}",
+                    "pass_fail":     "ERROR",
+                    "timestamp":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "claims":        [],
+                })
+
+    write_excel(results, "results.xlsx")
+
+    # Print quick summary
+    total  = len(results)
+    passed = sum(1 for r in results if r.get("pass_fail") == "PASS")
+    print(f"\nDone: {passed}/{total} passed")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
