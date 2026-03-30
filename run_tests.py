@@ -29,19 +29,40 @@ MODEL      = "gpt-4o"
 # ---------------------------------------------------------------------------
 
 RESPONSE_PROMPT = """\
-Generate a model response for the question below based on the document.
-Your response quality must match the scenario:
+You are generating a test response to the question below, using only the provided document.
+The response completeness MUST match the scenario exactly.
 
-- complete: Cover ALL information — every detail, number, condition, edge case.
-- mostly_complete: Cover main points but miss 2–3 specific details or numbers.
-- partial: Cover only 2–3 obvious surface-level points. Skip most specifics.
-- incomplete: Write 1–2 vague generic sentences. Barely address the question.
+Scenario definitions (follow precisely):
+
+  complete
+    • Cover EVERY critical fact, figure, condition, threshold, and edge case in the document.
+    • Include all supporting details (rates, fees, dates, exceptions, procedures).
+    • Use specific numbers and terms from the document — do not paraphrase vaguely.
+    • Target: a reader could answer any operational or compliance question from your response alone.
+
+  mostly_complete
+    • Cover ALL critical points (the core facts needed to answer the question).
+    • Intentionally omit 2–4 supporting details — e.g. one specific fee tier, one edge case,
+      one procedural step, or one numeric threshold. Do NOT omit any of the main facts.
+    • What you write must be accurate; just incomplete on the finer details.
+
+  partial
+    • Mention only 3–4 of the most obvious top-level facts from the document.
+    • Omit most specific numbers, conditions, and edge cases.
+    • Do NOT mention minor details, exceptions, or procedural steps.
+    • A reader would have a rough idea but could not answer detailed questions.
+
+  incomplete
+    • Write 2–3 short, generic sentences that barely address the question.
+    • Do NOT include any specific numbers, thresholds, fees, or named conditions.
+    • The response should be so vague it is almost useless for operational purposes.
 
 Scenario: {scenario}
 Question: {question}
-Document: {document}
+Document:
+{document}
 
-Return only the response text. No preamble.
+Return only the response text. No preamble, no labels, no explanation.
 """
 
 # ---------------------------------------------------------------------------
