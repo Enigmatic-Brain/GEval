@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import os
+from typing import Optional
 
 import aiohttp
 
@@ -46,23 +47,35 @@ _claim_cache: dict[str, list[dict]] = {}
 # ---------------------------------------------------------------------------
 
 EXTRACTION_PROMPT = """\
-You are an expert information analyst. Extract all claims from the document \
-that are necessary to fully answer the question.
+You are an expert information analyst. Your job is to extract every claim from \
+the document that is relevant to answering the question.
 
 **Question:** {question}
 **Document:** {document}
 
 Instructions:
-- Break relevant content into atomic claims (one distinct fact per claim).
-- Label each as "Critical" (answer meaningfully incomplete without it) or
-  "Supporting" (useful detail, not essential).
+1. Read the document carefully. Extract ONLY claims whose content appears \
+explicitly in the document — do not add outside knowledge or infer facts \
+not stated.
+2. Each claim must be atomic — one distinct fact per claim. Do not bundle \
+two facts into one claim (e.g. "rate is 11.5% and tenure is 12–60 months" \
+must be two separate claims).
+3. Be exhaustive — capture every figure, rate, threshold, condition, deadline, \
+exception, and procedural step that helps answer the question.
+4. Label importance strictly:
+   - "Critical": the question cannot be meaningfully answered without this fact. \
+If this claim were missing from a response, a reader would be significantly \
+misled or unable to act.
+   - "Supporting": useful context or detail that strengthens the answer but \
+whose absence would not make the answer wrong or dangerously incomplete.
+5. When in doubt between Critical and Supporting, prefer Critical.
 
 Call the `submit_claims` function with your answer.
 """
 
 BATCH_COVERAGE_PROMPT = """\
-You are an expert evaluator. For each claim below, assess whether the model \
-response covers it.
+You are an expert evaluator. For each claim listed below, assess how well the \
+model response covers it.
 
 **Question:** {question}
 
@@ -72,15 +85,30 @@ response covers it.
 **Claims to evaluate:**
 {claims_json}
 
-Scoring rubric:
-  2 = Fully Covered     — explicitly addressed with sufficient detail
-  1 = Partially Covered — touched on but lacking detail or precision
-  0 = Not Covered       — not addressed at all
+Scoring rubric — assign exactly one score per claim:
+  2 = Fully Covered
+      The response explicitly states this fact with enough precision that a \
+reader would learn the same information. Specific numbers, conditions, or \
+terms from the claim are present or clearly equivalent.
+
+  1 = Partially Covered
+      The response touches on the topic of this claim but is meaningfully \
+incomplete — e.g. mentions a fee exists but not the amount, mentions a rule \
+but not the condition that triggers it, or uses a vague term where the claim \
+has a specific value.
+
+  0 = Not Covered
+      The response does not address this claim at all, or only mentions it \
+so vaguely that a reader would not learn the fact.
 
 Rules:
-- Do not penalise extra information in the response.
-- Coverage must be reasonably explicit — do not infer.
-- Provide a brief reason per claim referencing the response.
+- Judge only what is explicitly written in the response. Do not give credit \
+for facts the reader would have to infer or already know.
+- Do not penalise the response for containing extra information beyond the claim.
+- If the claim contains multiple sub-facts (e.g. "rate is X and penalty is Y"), \
+score based on how many sub-facts are covered: both → 2, one → 1, none → 0.
+- Your reason must quote or directly reference the relevant part of the response \
+(or note its absence).
 
 Call the `submit_coverage_results` function with your answer.
 """
@@ -412,7 +440,7 @@ async def evaluate_completeness(
     question: str,
     model_response: str,
     document: str,
-    api_key: str | None = None,
+    api_key: Optional[str] = None,
     batch_size: int = BATCH_SIZE,
     max_concurrent: int = MAX_CONCURRENT,
 ) -> dict:
