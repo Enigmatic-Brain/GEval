@@ -79,11 +79,6 @@ two facts into one claim (e.g. "rate is 11.5% and tenure is 12-60 months" \
 must be two separate claims).
 3. Be exhaustive — capture every figure, rate, threshold, condition, deadline, \
 exception, and procedural step that helps answer the question.
-4. Label importance strictly:
-   - "Critical": the question cannot be meaningfully answered without this fact.
-   - "Supporting": useful context that strengthens the answer but whose absence \
-would not make it wrong or dangerously incomplete.
-5. When in doubt between Critical and Supporting, prefer Critical.
 
 --- TASK B: Response Claims ---
 Extract every distinct factual claim from the Model Response.
@@ -115,18 +110,19 @@ A wrong number is NOT a match even if the topic is the same.
 - Matched pairs go into `tp_pairs`.
 - Document Claim IDs with no match go into `fn_claim_ids` (missed by response).
 
-**Task 2 — Verify unmatched Response Claims (FP vs valid extra)**
+**Task 2 — Rescue or reject unmatched Response Claims**
 
-Source Document (for verification):
-{document}
+For each Response Claim not matched in Task 1, check whether it matches \
+any Document Claim that is still unmatched (same rules as Task 1 — \
+meaning-level match, numbers must be exact):
+- If it matches an unmatched Document Claim: move the pair to `tp_pairs` \
+and remove that Doc Claim ID from `fn_claim_ids`. This rescues alignment \
+misses from Task 1.
+- If it matches no Document Claim: it is outside the scope of the expected \
+answer → add to `fp_claims`.
 
-For each Response Claim not matched in Task 1, check whether the Source \
-Document supports it:
-- "Not Supported": the document does not contain this fact, contradicts it, \
-or the claim uses a wrong number/value/date. → Add to `fp_claims`.
-- "Supported": the document explicitly states this fact (or clearly \
-equivalent). The response included valid extra detail beyond the expected \
-answer. → Add to `supported_unmatched` (NOT a false positive).
+Only use the Document Claims list above — do NOT check against the raw \
+source document. Anything not in the Document Claims is FP.
 
 Call the `submit_alignment` function with your answer.
 """
@@ -149,14 +145,10 @@ COMBINED_EXTRACTION_FUNCTION = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "claim_id":   {"type": "integer"},
-                            "claim":      {"type": "string"},
-                            "importance": {
-                                "type": "string",
-                                "enum": ["Critical", "Supporting"],
-                            },
+                            "claim_id": {"type": "integer"},
+                            "claim":    {"type": "string"},
                         },
-                        "required": ["claim_id", "claim", "importance"],
+                        "required": ["claim_id", "claim"],
                     },
                 },
                 "response_claims": {
@@ -204,20 +196,7 @@ ALIGNMENT_FUNCTION = {
                 },
                 "fp_claims": {
                     "type": "array",
-                    "description": "Unmatched response claims NOT supported by the document (FP — hallucinations).",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "response_claim_id": {"type": "integer"},
-                            "claim_text":        {"type": "string"},
-                            "reason":            {"type": "string"},
-                        },
-                        "required": ["response_claim_id", "claim_text", "reason"],
-                    },
-                },
-                "supported_unmatched": {
-                    "type": "array",
-                    "description": "Unmatched response claims that ARE supported by the document (valid extra detail, not FP).",
+                    "description": "Unmatched response claims with no matching doc claim (FP — outside expected answer scope).",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -229,7 +208,7 @@ ALIGNMENT_FUNCTION = {
                     },
                 },
             },
-            "required": ["tp_pairs", "fn_claim_ids", "fp_claims", "supported_unmatched"],
+            "required": ["tp_pairs", "fn_claim_ids", "fp_claims"],
         },
     },
 }
@@ -321,11 +300,9 @@ async def extract_all_claims(
     doc_claims      = result["doc_claims"]
     response_claims = result["response_claims"]
 
-    n_critical   = sum(1 for c in doc_claims if c["importance"] == "Critical")
-    n_supporting = len(doc_claims) - n_critical
-    log.info(f"  {len(doc_claims)} doc claims ({n_critical} critical, {n_supporting} supporting)")
+    log.info(f"  {len(doc_claims)} doc claims extracted")
     for c in doc_claims:
-        log.info(f"  [{c['importance']}] D{c['claim_id']}: {c['claim']}")
+        log.info(f"  D{c['claim_id']}: {c['claim']}")
     log.info(f"  {len(response_claims)} response claims")
     for c in response_claims:
         log.info(f"  R{c['claim_id']}: {c['claim_text']}")
@@ -342,19 +319,19 @@ async def align_and_classify(
     api_key:         str,
     doc_claims:      list[dict],
     response_claims: list[dict],
-    document:        str,
     max_retries:     int = MAX_RETRIES,
 ) -> dict:
     """
-    Bipartite claim matching + inline FP verification in a single LLM call.
-    Returns: {tp_pairs, fn_claim_ids, fp_claims, supported_unmatched}
+    Bipartite claim matching + rescue pass in a single LLM call.
+    Task 1: match response claims to doc claims → TP / FN.
+    Task 2: check unmatched response claims against doc claims only → rescue TP or FP.
+    Returns: {tp_pairs, fn_claim_ids, fp_claims}
 
     On permanent failure falls back conservatively: all doc claims → FN,
     all response claims → FP.
     """
     doc_claims_json = json.dumps(
-        [{"claim_id": c["claim_id"], "claim": c["claim"], "importance": c["importance"]}
-         for c in doc_claims],
+        [{"claim_id": c["claim_id"], "claim": c["claim"]} for c in doc_claims],
         indent=2,
     )
     response_claims_json = json.dumps(
@@ -366,7 +343,6 @@ async def align_and_classify(
     prompt = ALIGNMENT_PROMPT.format(
         doc_claims_json=doc_claims_json,
         response_claims_json=response_claims_json,
-        document=document,
     )
 
     last_error = None
@@ -380,8 +356,7 @@ async def align_and_classify(
             log.info(
                 f"  TP={len(result['tp_pairs'])}, "
                 f"FN={len(result['fn_claim_ids'])}, "
-                f"FP={len(result['fp_claims'])}, "
-                f"Supported extra={len(result['supported_unmatched'])}"
+                f"FP={len(result['fp_claims'])}"
             )
             return result
         except Exception as exc:
@@ -405,7 +380,6 @@ async def align_and_classify(
             }
             for c in response_claims
         ],
-        "supported_unmatched": [],
     }
 
 # ---------------------------------------------------------------------------
@@ -446,7 +420,6 @@ def compute_confusion_matrix(
             "response_claim_id": pair["response_claim_id"],
             "doc_claim":         doc_by_id.get(pair["doc_claim_id"], {}).get("claim", ""),
             "response_claim":    response_by_id.get(pair["response_claim_id"], {}).get("claim_text", ""),
-            "importance":        doc_by_id.get(pair["doc_claim_id"], {}).get("importance", ""),
         }
         for pair in alignment["tp_pairs"]
     ]
@@ -455,7 +428,6 @@ def compute_confusion_matrix(
         {
             "doc_claim_id": cid,
             "doc_claim":    doc_by_id.get(cid, {}).get("claim", ""),
-            "importance":   doc_by_id.get(cid, {}).get("importance", ""),
         }
         for cid in alignment["fn_claim_ids"]
     ]
@@ -471,7 +443,6 @@ def compute_confusion_matrix(
         "tp_claims":       tp_claims,
         "fp_claims":       alignment["fp_claims"],
         "fn_claims":       fn_claims,
-        "supported_unmatched": alignment.get("supported_unmatched", []),
         "doc_claims":      doc_claims,
         "response_claims": response_claims,
     }
@@ -502,9 +473,8 @@ async def evaluate_confusion_matrix(
         precision_label       — "Relevant" | "Not Relevant"
         recall_label          — "Complete" | "Incomplete"
         tp_claims             — matched pairs (doc + response claim text)
-        fp_claims             — hallucinated response claims with reasons
-        fn_claims             — missed doc claims with importance labels
-        supported_unmatched   — valid extra response claims (doc-supported, not FP)
+        fp_claims             — response claims outside expected answer scope
+        fn_claims             — doc claims missed by the response
         doc_claims            — raw extracted doc claims
         response_claims       — raw extracted response claims
     """
@@ -525,7 +495,7 @@ async def evaluate_confusion_matrix(
 
         # Step 3: align and classify
         alignment = await align_and_classify(
-            session, api_key, doc_claims, response_claims, document
+            session, api_key, doc_claims, response_claims
         )
 
     # Step 4: local math
@@ -546,7 +516,7 @@ def print_report(result: dict) -> None:
     if result["fn_claims"]:
         print(f"\n  ❌ Missed Claims — FN ({result['fn']}):")
         for c in result["fn_claims"]:
-            print(f"     [{c['importance']}] {c['doc_claim']}")
+            print(f"     • {c['doc_claim']}")
 
     if result["fp_claims"]:
         print(f"\n  ⚠️  Hallucinations — FP ({result['fp']}):")
@@ -554,15 +524,10 @@ def print_report(result: dict) -> None:
             print(f"     • {c['claim_text']}")
             print(f"       Reason: {c['reason']}")
 
-    if result["supported_unmatched"]:
-        print(f"\n  ℹ️  Valid Extra Claims ({len(result['supported_unmatched'])}) [doc-supported, not FP]:")
-        for c in result["supported_unmatched"]:
-            print(f"     • {c['claim_text']}")
-
     if result["tp_claims"]:
         print(f"\n  ✅ Covered Claims — TP ({result['tp']}):")
         for c in result["tp_claims"]:
-            print(f"     [{c['importance']}] {c['doc_claim']}")
+            print(f"     • {c['doc_claim']}")
 
     print("=" * 65 + "\n")
 
